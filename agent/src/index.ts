@@ -21,6 +21,7 @@ import {
 import { defaultCharacter } from "./defaultCharacter.ts";
 
 import { bootstrapPlugin } from "@elizaos/plugin-bootstrap";
+import { loadEnabledSanityCharacters } from "@elizaos-plugins/plugin-sanity";
 
 import fs from "fs";
 import net from "net";
@@ -316,48 +317,74 @@ async function readCharactersFromStorage(
 }
 
 export async function loadCharacters(
-    charactersArg: string
-): Promise<Character[]> {
-    let characterPaths = commaSeparatedStringToArray(charactersArg);
-
-    if (process.env.USE_CHARACTER_STORAGE === "true") {
-        characterPaths = await readCharactersFromStorage(characterPaths);
-    }
-
+    charactersArg: string | undefined
+): Promise<Character[]> { // Adjusted type to match usage
     const loadedCharacters: Character[] = [];
-
-    if (characterPaths?.length > 0) {
+  
+    // console.log("loadCharacters starting with charactersArg:", charactersArg);
+    // console.log("REMOTE_CHARACTER_URLS:", process.env.REMOTE_CHARACTER_URLS);
+    // console.log("USE_CHARACTER_STORAGE:", process.env.USE_CHARACTER_STORAGE);
+  
+    // Handle CLI arguments (character paths)
+    if (charactersArg) {
+      elizaLogger.info("Loading characters from CLI arguments");
+      let characterPaths = commaSeparatedStringToArray(charactersArg);
+  
+      // Include characters from storage if enabled
+      if (process.env.USE_CHARACTER_STORAGE === "true") {
+        characterPaths = await readCharactersFromStorage(characterPaths);
+      }
+  
+      // Load characters from specified paths
+      if (characterPaths?.length > 0) {
         for (const characterPath of characterPaths) {
-            try {
-                const character: Character = await loadCharacterTryPath(
-                    characterPath
-                );
-                loadedCharacters.push(character);
-            } catch (e) {
-                process.exit(1);
-            }
+          try {
+            const character: Character = await loadCharacterTryPath(characterPath);
+            loadedCharacters.push(character);
+            elizaLogger.info(`Loaded character from path: ${character.name}`);
+          } catch (e) {
+            elizaLogger.error(`Failed to load character from ${characterPath}: ${e}`);
+          }
         }
+      }
     }
-
-    if (hasValidRemoteUrls()) {
-        elizaLogger.info("Loading characters from remote URLs");
-        const characterUrls = commaSeparatedStringToArray(
-            process.env.REMOTE_CHARACTER_URLS
-        );
-        for (const characterUrl of characterUrls) {
-            const characters = await loadCharactersFromUrl(characterUrl);
-            loadedCharacters.push(...characters);
+  
+    // Load from remote URLs if provided and no CLI args
+    if (!charactersArg && hasValidRemoteUrls()) {
+      elizaLogger.info("Loading characters from remote URLs");
+      const characterUrls = commaSeparatedStringToArray(process.env.REMOTE_CHARACTER_URLS);
+      for (const characterUrl of characterUrls) {
+        try {
+          const characters = await loadCharactersFromUrl(characterUrl);
+          loadedCharacters.push(...characters);
+          elizaLogger.info(`Loaded ${characters.length} characters from ${characterUrl}`);
+        } catch (e) {
+          elizaLogger.error(`Failed to load characters from ${characterUrl}: ${e}`);
         }
+      }
     }
-
+  
+    // Load from Sanity if no CLI args or remote URLs
+    if (!charactersArg && !hasValidRemoteUrls()) {
+      elizaLogger.debug("Fetching enabled characters from Sanity");
+      try {
+        const sanityCharacters = await loadEnabledSanityCharacters();
+        loadedCharacters.push(...sanityCharacters);
+        elizaLogger.info(`Loaded ${sanityCharacters.length} characters from Sanity`);
+      } catch (e) {
+        elizaLogger.error(`Failed to load characters from Sanity: ${e}`);
+      }
+    }
+  
+    // Fallback to default character if none loaded
     if (loadedCharacters.length === 0) {
-        elizaLogger.info("No characters found, using default character");
-        loadedCharacters.push(defaultCharacter);
+      elizaLogger.info("No characters found, using default character");
+      loadedCharacters.push(defaultCharacter);
     }
-
+  
+    elizaLogger.info("Total characters loaded:", loadedCharacters.map(c => c.name));
     return loadedCharacters;
-}
-
+  }
 async function handlePluginImporting(plugins: string[]) {
     if (plugins.length > 0) {
         elizaLogger.info("Plugins are: ", plugins);
@@ -792,56 +819,100 @@ const hasValidRemoteUrls = () =>
     process.env.REMOTE_CHARACTER_URLS !== "" &&
     process.env.REMOTE_CHARACTER_URLS.startsWith("http");
 
-const startAgents = async () => {
-    const directClient = new DirectClient();
-    let serverPort = Number.parseInt(settings.SERVER_PORT || "3000");
-    const args = parseArguments();
-    const charactersArg = args.characters || args.character;
-    let characters = [defaultCharacter];
-
-    if ((charactersArg) || hasValidRemoteUrls()) {
-        characters = await loadCharacters(charactersArg);
-    }
-
-    try {
-        for (const character of characters) {
-            await startAgent(character, directClient);
+    const startAgents = async () => {
+        const directClient = new DirectClient();
+        let serverPort = Number.parseInt(settings.SERVER_PORT || "3000");
+        const args = parseArguments();
+        elizaLogger.info("Parsed arguments:", args);
+        const charactersArg = args.characters || args.character;
+    
+        // Load all characters
+        let characters: Character[] = [];
+        try {
+            characters = await loadCharacters(charactersArg);
+        } catch (error) {
+            elizaLogger.error("Failed to load characters:", error);
+            process.exit(1);
         }
-    } catch (error) {
-        elizaLogger.error("Error starting agents:", error);
-    }
-
-    // Find available port
-    while (!(await checkPortAvailable(serverPort))) {
-        elizaLogger.warn(
-            `Port ${serverPort} is in use, trying ${serverPort + 1}`
+    // Log detailed contents of characters array
+    elizaLogger.info("Loaded characters array:", {
+        count: characters.length,
+        characters: characters.map((char, index) => ({
+          index,
+          _id: char._id,
+          id: char.id,
+          name: char.name,
+          username: char.username,
+          modelProvider: char.modelProvider,
+          plugins: char.plugins?.map(p => p.name) || [],
+          bio: char.bio,
+          lore: char.lore,
+          topics: char.topics,
+          adjectives: char.adjectives,
+          style: char.style,
+          settings: {
+            secrets: Object.keys(char.settings?.secrets || {}),
+            voice: char.settings?.voice,
+            ragKnowledge: char.settings?.ragKnowledge,
+          },
+          knowledge: char.knowledge?.map(k => ({
+            id: k.id,
+            agentId: k.agentId,
+            content: {
+              text: k.content.text || "(empty)", // Removed truncation
+              metadata: k.content.metadata,
+            },
+            createdAt: k.createdAt,
+          })) || [],
+          messageExamples: char.messageExamples,
+          postExamples: char.postExamples,
+          system: char.system,
+          templates: char.templates,
+          profile: char.profile,
+        })),
+      });
+        // Start agents for each character
+        if (characters.length === 0) {
+            elizaLogger.warn("No characters to start");
+        } else {
+            for (const character of characters) {
+                elizaLogger.info(`Starting agent for character: ${character.name}`);
+                try {
+                    await startAgent(character, directClient);
+                } catch (error) {
+                    elizaLogger.error(`Failed to start agent for ${character.name}:`, error);
+                    // Continue with next character
+                }
+            }
+        }
+    
+        // Find available port
+        while (!(await checkPortAvailable(serverPort))) {
+            elizaLogger.warn(`Port ${serverPort} is in use, trying ${serverPort + 1}`);
+            serverPort++;
+        }
+    
+        // Configure directClient
+        directClient.startAgent = async (character) => {
+            character.plugins = await handlePluginImporting(character.plugins);
+            return startAgent(character, directClient);
+        };
+    
+        directClient.loadCharacterTryPath = loadCharacterTryPath;
+        directClient.jsonToCharacter = jsonToCharacter;
+    
+        // Start the server
+        directClient.start(serverPort);
+        elizaLogger.info(`DirectClient server started on port ${serverPort}`);
+    
+        if (serverPort !== Number.parseInt(settings.SERVER_PORT || "3000")) {
+            elizaLogger.log(`Server started on alternate port ${serverPort}`);
+        }
+    
+        elizaLogger.info(
+            "Run `pnpm start:client` to start the client and visit the outputted URL (http://localhost:5173) to chat with your agents. When running multiple agents, use client with different port `SERVER_PORT=3001 pnpm start:client`"
         );
-        serverPort++;
-    }
-
-    // upload some agent functionality into directClient
-    // This is used in client-direct/api.ts at "/agents/:agentId/set" route to restart an agent
-    directClient.startAgent = async (character) => {
-        // Handle plugins
-        character.plugins = await handlePluginImporting(character.plugins);
-
-        // wrap it so we don't have to inject directClient later
-        return startAgent(character, directClient);
     };
-
-    directClient.loadCharacterTryPath = loadCharacterTryPath;
-    directClient.jsonToCharacter = jsonToCharacter;
-
-    directClient.start(serverPort);
-
-    if (serverPort !== Number.parseInt(settings.SERVER_PORT || "3000")) {
-        elizaLogger.log(`Server started on alternate port ${serverPort}`);
-    }
-
-    elizaLogger.info(
-        "Run `pnpm start:client` to start the client and visit the outputted URL (http://localhost:5173) to chat with your agents. When running multiple agents, use client with different port `SERVER_PORT=3001 pnpm start:client`"
-    );
-};
 
 startAgents().catch((error) => {
     elizaLogger.error("Unhandled error in startAgents:", error);
